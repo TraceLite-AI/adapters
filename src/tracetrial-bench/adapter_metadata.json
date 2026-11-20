@@ -1,0 +1,54 @@
+[
+  {
+    "adapter_name": "tracetrial-bench",
+    "adapter_builders": [
+      "TraceLite-AI (290594480+zsicheng0214@users.noreply.github.com)"
+    ],
+    "original_benchmark": [
+      {
+        "split": "single-turn",
+        "size": 69,
+        "harness": "agent",
+        "supported_agents": [
+          "claude-code",
+          "codex",
+          "opencode",
+          "openhands",
+          "hermes-agent",
+          "openclaw"
+        ],
+        "adaptable": true,
+        "notes": "Single-turn subset of TraceTrial-Bench (arXiv:2610.32285) spanning 6 harness capability families (C/E/G/L/O/T)."
+      },
+      {
+        "split": "full",
+        "size": 96,
+        "harness": "agent",
+        "supported_agents": [
+          "claude-code",
+          "codex",
+          "opencode",
+          "openhands",
+          "hermes-agent",
+          "openclaw"
+        ],
+        "adaptable": true,
+        "notes": "Full repository task set (94 core tasks + 2 calibration controls), including 23 fixed_turns and 4 simulated-user tasks with turns.json."
+      }
+    ],
+    "harbor_adapter": [
+      {
+        "split": "single-turn",
+        "adapted_benchmark_size": 69,
+        "parity_benchmark_size": 69,
+        "parity_sampling_rate": 1.0,
+        "registry_benchmark_size": 69,
+        "added_agents": [],
+        "parity_matching_agents": [],
+        "parity_unmatching_agents": null,
+        "parity_costs": null,
+        "notes": "Draft/WIP adapter pending maintainer coordination on ATIF-to-TraceTrial trace bridge, multi-turn simulated-user wiring, and matched 3-run parity."
+      }
+    ]
+  }
+]
