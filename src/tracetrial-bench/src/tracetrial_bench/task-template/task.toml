@@ -1,4 +1,5 @@
 schema_version = "1.0"
+artifacts = ["/workspace"]
 
 [task]
 name = "tracelite-ai/tracetrial-bench__{task_id_lower}"
@@ -18,7 +19,8 @@ category = "{category}"
 input_mode = "{input_mode}"
 
 [verifier]
-network_mode = "none"
+environment_mode = "separate"
+network_mode = "no-network"
 timeout_sec = {verifier_timeout_sec}
 
 [agent]

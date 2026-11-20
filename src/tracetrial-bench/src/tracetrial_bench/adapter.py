@@ -140,7 +140,7 @@ class TraceTrialBenchAdapter:
             category=category.replace('"', "'"),
             input_mode=input_mode,
             verifier_timeout_sec=verifier_timeout,
-            agent_network_mode="none",
+            agent_network_mode="public",
             agent_timeout_sec=agent_timeout,
         )
         (dst_task_dir / "task.toml").write_text(rendered_toml, encoding="utf-8")
@@ -164,12 +164,17 @@ class TraceTrialBenchAdapter:
         )
         sim_script.chmod(0o755)
 
-        # 4. Stage solution/solve.sh
+        # 4. Stage solution/solve.sh (reference oracle for E8 representative task)
         solve_dst = dst_sol / "solve.sh"
-        shutil.copy2(self.template_dir / "solution" / "solve.sh", solve_dst)
+        ref_e8 = Path(__file__).resolve().parent / "e8_reference_solve.sh"
+        if task_id == "E8-exit-code-masked-by-output-001" and ref_e8.is_file():
+            shutil.copy2(ref_e8, solve_dst)
+        else:
+            shutil.copy2(self.template_dir / "solution" / "solve.sh", solve_dst)
         solve_dst.chmod(0o755)
 
-        # 5. Stage isolated verifier into tests/ (kept out of agent container image)
+        # 5. Stage separate verifier container context into tests/ (Harbor #3712)
+        shutil.copy2(self.template_dir / "tests" / "Dockerfile", dst_tests / "Dockerfile")
         test_sh_dst = dst_tests / "test.sh"
         shutil.copy2(self.template_dir / "tests" / "test.sh", test_sh_dst)
         test_sh_dst.chmod(0o755)

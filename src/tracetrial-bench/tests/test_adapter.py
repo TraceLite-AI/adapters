@@ -94,6 +94,9 @@ def test_split_filtering_and_generation_isolation(tmp_path: Path) -> None:
     cfg = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
     assert cfg["task"]["name"] == "tracelite-ai/tracetrial-bench__c1-demo-001"
     assert cfg["metadata"]["dimension"] == "C"
+    assert cfg["verifier"]["environment_mode"] == "separate"
+    assert cfg["artifacts"] == ["/workspace"]
+    assert (task_dir / "tests" / "Dockerfile").is_file()
 
     # Verify strict isolation: workspace has input/data.txt, NEVER verifier files
     assert (task_dir / "environment" / "workspace" / "input" / "data.txt").is_file()

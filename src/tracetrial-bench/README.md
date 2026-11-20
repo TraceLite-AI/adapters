@@ -58,6 +58,7 @@ datasets/tracetrial-bench/<task-id-lower>/
 ├── solution/
 │   └── solve.sh              # Placeholder (open oracle design question in Draft PR)
 └── tests/
+    ├── Dockerfile            # Dedicated separate verifier image (Harbor #3712)
     ├── test.sh               # Entrypoint writing /logs/verifier/reward.txt
     ├── verify.py             # ATIF -> TraceTrial event bridge + rule scorer
     └── verifier/             # Untouched Task/<id>/verifier/ scripts & YAML specs
