@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
+from atif_bridge import (
+    build_trace_and_probe_from_atif,
+    build_trace_and_probe_from_opencode_jsonl,
+)
 
 TESTS_DIR = Path(__file__).resolve().parent
 VERIFIER_SRC = TESTS_DIR / "verifier"
@@ -17,144 +21,118 @@ WORKSPACE_DIR = Path(os.environ.get("HARNESSBENCH_WORKSPACE", "/workspace"))
 LOGS_VERIFIER = Path(os.environ.get("HARBOR_VERIFIER_LOG_DIR", "/logs/verifier"))
 LOGS_AGENT = Path(os.environ.get("HARBOR_AGENT_LOG_DIR", "/logs/agent"))
 LOGS_ARTIFACTS = Path(os.environ.get("HARBOR_ARTIFACTS_DIR", "/logs/artifacts"))
-
-_EXIT_RE = re.compile(
-    r"(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?|exit[_ -]?code[\"']?\s*[:=]?)\s*(-?\d+)\b",
-    re.IGNORECASE,
-)
+TRACE_BUNDLE = LOGS_ARTIFACTS / "trace_bundle"
+EXPECTED_ORACLE_SHA_FILE = TESTS_DIR / "oracle_sha256.txt"
+TASK_ID_FILE = TESTS_DIR / "task_id.txt"
 
 
-def _find_atif() -> Path | None:
-    for candidate in (
-        LOGS_AGENT / "trajectory.json",
-        LOGS_ARTIFACTS / "trajectory.json",
-    ):
-        if candidate.is_file():
-            return candidate
+def _trace_source_dir() -> Path:
+    return TRACE_BUNDLE if TRACE_BUNDLE.is_dir() else LOGS_AGENT
+
+
+def _verified_oracle_mode() -> bool:
+    sol = TRACE_BUNDLE / "solve.sh"
+    if not sol.is_file():
+        sol = Path("/solution/solve.sh")
+    if not sol.is_file() or not EXPECTED_ORACLE_SHA_FILE.is_file():
+        return False
+    expected = EXPECTED_ORACLE_SHA_FILE.read_text(encoding="utf-8").strip()
+    actual = hashlib.sha256(sol.read_bytes()).hexdigest()
+    return bool(expected) and actual == expected
+
+
+def _load_containment() -> dict[str, Any] | None:
+    for p in (TRACE_BUNDLE / "process_containment.json", LOGS_AGENT / "process_containment.json"):
+        if p.is_file():
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(d, dict):
+                    return d
+            except (OSError, json.JSONDecodeError):
+                pass
     return None
 
 
-def _convert_atif(atif_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
-    try:
-        doc = json.loads(atif_path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
-        return [], {}, {}
-    steps = doc.get("steps") if isinstance(doc, dict) else None
-    if not isinstance(steps, list):
-        return [], {}, {}
+def _resolve_trace(task_id: str) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    containment = _load_containment()
+    src_dir = _trace_source_dir()
+    opencode_log = src_dir / "opencode.txt"
+    atif_file = src_dir / "trajectory.json"
+    if opencode_log.is_file():
+        prompt_text = None
+        if atif_file.is_file():
+            try:
+                adoc = json.loads(atif_file.read_text(encoding="utf-8", errors="replace"))
+                for st in adoc.get("steps") or []:
+                    if isinstance(st, dict) and st.get("source") == "user" and isinstance(st.get("message"), str):
+                        prompt_text = st["message"]
+                        break
+            except (OSError, json.JSONDecodeError):
+                pass
+        events, summary, probe = build_trace_and_probe_from_opencode_jsonl(
+            opencode_log,
+            prompt_text=prompt_text,
+            task_id=task_id,
+            containment_override=containment,
+        )
+        if events:
+            return events, summary, probe
 
-    events: list[dict[str, Any]] = [{"seq": 1, "event_type": "run_started", "source": "harbor_atif"}]
-    post_obs: list[dict[str, Any]] = []
-    seq = 2
+    if atif_file.is_file():
+        return build_trace_and_probe_from_atif(atif_file, task_id=task_id, containment_override=containment)
 
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        source = str(step.get("source") or "")
-        msg = step.get("message")
-        obs_map: dict[str, dict[str, Any]] = {}
-        obs = step.get("observation")
-        if isinstance(obs, dict):
-            for r in obs.get("results") or []:
-                if isinstance(r, dict) and r.get("source_call_id"):
-                    obs_map[str(r["source_call_id"])] = r
-        tcs = step.get("tool_calls")
-        if isinstance(tcs, list) and tcs:
-            if source == "agent" and isinstance(msg, str) and msg.strip():
-                events.append({"seq": seq, "event_type": "assistant_message", "content": msg, "text": msg})
-                seq += 1
-            for tc in tcs:
-                if not isinstance(tc, dict):
-                    continue
-                cid = str(tc.get("tool_call_id") or f"call-{seq:04d}")
-                fn = str(tc.get("function_name") or tc.get("name") or "tool")
-                args = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
-                res_obj = obs_map.get(cid, {})
-                out = res_obj.get("content", "")
-                if not isinstance(out, str):
-                    out = json.dumps(out, ensure_ascii=False)
-                extra = res_obj.get("extra") if isinstance(res_obj.get("extra"), dict) else {}
-                ec = extra.get("exit_code")
-                if not isinstance(ec, int) or isinstance(ec, bool):
-                    m = _EXIT_RE.search(out)
-                    ec = int(m.group(1)) if m else 0
-                is_err = extra.get("is_error")
-                if not isinstance(is_err, bool):
-                    is_err = ec != 0
-                events.append(
-                    {
-                        "seq": seq,
-                        "event_type": "tool",
-                        "tool_call": {
-                            "call_id": cid,
-                            "tool_call_id": cid,
-                            "name": fn,
-                            "tool_name": fn,
-                            "provider_executed": True,
-                            "arguments": args,
-                        },
-                        "tool_result": {
-                            "call_id": cid,
-                            "tool_call_id": cid,
-                            "tool_name": fn,
-                            "content": out,
-                            "exit_code": ec,
-                            "error": is_err,
-                            "status": "failed" if is_err else "completed",
-                        },
-                    }
-                )
-                post_obs.append(
-                    {
-                        "tool_call_id": cid,
-                        "tool_name": fn,
-                        "arguments": args,
-                        "exit_code": ec,
-                        "error": is_err,
-                        "status": "failed" if is_err else "completed",
-                    }
-                )
-                seq += 1
-        elif source == "agent" and isinstance(msg, str) and msg.strip():
-            events.append({"seq": seq, "event_type": "assistant_message", "content": msg, "text": msg})
-            seq += 1
+    for oracle_atif in (src_dir / "oracle_trajectory.json", LOGS_AGENT / "oracle_trajectory.json", LOGS_ARTIFACTS / "trajectory.json"):
+        if oracle_atif.is_file() and _verified_oracle_mode():
+            return build_trace_and_probe_from_atif(oracle_atif, task_id=task_id, containment_override=containment)
 
-    events.append({"seq": seq, "event_type": "run_finished", "status": "completed"})
-    summary = {
-        "trace_complete": True,
-        "status": "finished",
-        "timed_out": False,
-        "error_type": None,
-        "last_event_seq": len(events),
-    }
-    return events, summary, {"post_tool_observations": post_obs}
+    return [], {}, {}
 
 
-def _score_from_payload(payload: dict[str, Any]) -> float:
-    if isinstance(payload.get("score"), (int, float)):
+def _layer_mean(entries: Any) -> float | None:
+    if not isinstance(entries, list) or not entries:
+        return None
+    vals: list[float] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            if isinstance(entry.get("score"), (int, float)) and not isinstance(entry.get("score"), bool):
+                vals.append(float(entry["score"]))
+            elif isinstance(entry.get("passed"), bool):
+                vals.append(1.0 if entry["passed"] else 0.0)
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def _score_from_payload(payload: dict[str, Any]) -> tuple[float, dict[str, float]]:
+    if isinstance(payload.get("score"), (int, float)) and not isinstance(payload.get("score"), bool):
         val = float(payload["score"])
-        return val / 100.0 if val > 1.0 else max(0.0, min(1.0, val))
+        norm = val / 100.0 if val > 1.0 else max(0.0, min(1.0, val))
+        return norm, {"reward": norm}
     if isinstance(payload.get("pass"), bool):
-        return 1.0 if payload["pass"] else 0.0
+        norm = 1.0 if payload["pass"] else 0.0
+        return norm, {"reward": norm}
     if isinstance(payload.get("passed"), bool):
-        return 1.0 if payload["passed"] else 0.0
+        norm = 1.0 if payload["passed"] else 0.0
+        return norm, {"reward": norm}
     rules = payload.get("rule_results")
     if isinstance(rules, dict):
-        items: list[float] = []
-        for layer_key in ("harness", "agent"):
-            for entry in rules.get(layer_key) or []:
-                if isinstance(entry, dict):
-                    if isinstance(entry.get("score"), (int, float)):
-                        items.append(float(entry["score"]))
-                    elif isinstance(entry.get("passed"), bool):
-                        items.append(1.0 if entry["passed"] else 0.0)
-        if items:
-            return max(0.0, min(1.0, sum(items) / len(items)))
-    return 0.0
+        a_mean = _layer_mean(rules.get("agent"))
+        h_mean = _layer_mean(rules.get("harness"))
+        if a_mean is not None and h_mean is not None:
+            overall = max(0.0, min(1.0, 0.5 * a_mean + 0.5 * h_mean))
+            return overall, {
+                "reward": overall,
+                "agent_rule_score": a_mean,
+                "harness_rule_score": h_mean,
+            }
+        if a_mean is not None:
+            return a_mean, {"reward": a_mean, "agent_rule_score": a_mean}
+        if h_mean is not None:
+            return h_mean, {"reward": h_mean, "harness_rule_score": h_mean}
+    return 0.0, {"reward": 0.0}
 
 
 def main() -> int:
     LOGS_VERIFIER.mkdir(parents=True, exist_ok=True)
+    task_id = TASK_ID_FILE.read_text(encoding="utf-8").strip() if TASK_ID_FILE.is_file() else "unknown"
     run_root = LOGS_VERIFIER / "run_layout"
     trace_dir = run_root / "artifacts" / "trace" / "harbor"
     probe_dir = run_root / "artifacts" / "execution_probe"
@@ -163,22 +141,22 @@ def main() -> int:
     for d in (trace_dir, probe_dir, out_dir, agent_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    atif_file = _find_atif()
-    if atif_file is not None:
-        events, summary, probe = _convert_atif(atif_file)
-        if events:
-            (trace_dir / "events.json").write_text(
-                json.dumps(events, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            (trace_dir / "summary.json").write_text(
-                json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            (probe_dir / "evidence.json").write_text(
-                json.dumps(probe, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+    events, summary, probe = _resolve_trace(task_id)
+    if events:
+        events_path = trace_dir / "events.json"
+        summary_path = trace_dir / "summary.json"
+        summary = {**summary, "events_path": str(events_path), "summary_path": str(summary_path)}
+        events_path.write_text(json.dumps(events, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        probe["source_trace"] = str(events_path)
+        (probe_dir / "evidence.json").write_text(
+            json.dumps(probe, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (run_root / "artifacts" / "container_lifecycle.json").write_text(
+            json.dumps({"archive_status": "complete", "cleanup_status": "complete", "error_type": None}, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     env = dict(os.environ)
     env["HARNESSBENCH_RUN_DIR"] = str(run_root)
@@ -204,6 +182,7 @@ def main() -> int:
     )
 
     reward = 0.0
+    sub_metrics: dict[str, float] = {"reward": 0.0}
     parsed_payload: dict[str, Any] = {
         "exit_code": completed.returncode,
         "stderr": completed.stderr[-2000:],
@@ -213,17 +192,19 @@ def main() -> int:
         if s.startswith("{"):
             try:
                 parsed_payload = json.loads(s)
-                reward = _score_from_payload(parsed_payload)
+                reward, sub_metrics = _score_from_payload(parsed_payload)
                 break
             except json.JSONDecodeError:
                 continue
     else:
         try:
             parsed_payload = json.loads(completed.stdout.strip())
-            reward = _score_from_payload(parsed_payload)
+            reward, sub_metrics = _score_from_payload(parsed_payload)
         except json.JSONDecodeError:
             reward = 1.0 if completed.returncode == 0 and "PASS" in completed.stdout else 0.0
+            sub_metrics = {"reward": reward}
 
+    parsed_payload["computed_metrics"] = sub_metrics
     (LOGS_VERIFIER / "tracetrial_score.json").write_text(
         json.dumps(parsed_payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",

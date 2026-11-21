@@ -23,6 +23,9 @@ environment_mode = "separate"
 network_mode = "no-network"
 timeout_sec = {verifier_timeout_sec}
 
+[[verifier.collect]]
+command = "python3 /opt/tracetrial/collect_containment.py"
+
 [agent]
 network_mode = "{agent_network_mode}"
 timeout_sec = {agent_timeout_sec}

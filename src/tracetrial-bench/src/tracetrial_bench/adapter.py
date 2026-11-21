@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -15,6 +16,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 TASK_TEMPLATE_DIR = Path(__file__).resolve().parent / "task-template"
+VALID_SPLITS = ("standalone", "single-turn", "parity", "all")
 
 
 class TraceTrialBenchAdapter:
@@ -28,12 +30,12 @@ class TraceTrialBenchAdapter:
         output_dir: Path,
         *,
         source_dir: Path | None = None,
-        split: str = "single-turn",
+        split: str = "standalone",
     ) -> None:
         self.output_dir = Path(output_dir)
         self.source_dir = Path(source_dir) if source_dir is not None else None
-        if split not in ("single-turn", "all"):
-            raise ValueError(f"Unsupported split {split!r}; expected 'single-turn' or 'all'")
+        if split not in VALID_SPLITS:
+            raise ValueError(f"Unsupported split {split!r}; expected one of {VALID_SPLITS}")
         self.split = split
         self.template_dir = TASK_TEMPLATE_DIR
 
@@ -75,8 +77,26 @@ class TraceTrialBenchAdapter:
         return repo_path, tmp
 
     @staticmethod
-    def _task_matches_split(meta: dict[str, Any], split: str) -> bool:
+    def _task_matches_split(task_dir: Path, meta: dict[str, Any], split: str) -> bool:
         if split == "all":
+            return True
+        if (task_dir / "simulator").exists():
+            return False
+        harness_meta = meta.get("harness") if isinstance(meta.get("harness"), dict) else {}
+        subdim = str(harness_meta.get("subdimension") or "")
+        # L4 and L5 require multi-principal child-subagent session transcripts not modeled by single-session ATIF
+        if subdim in ("L4", "L5"):
+            return False
+        exec_json = task_dir / "runtime" / "execution.json"
+        if exec_json.is_file():
+            try:
+                ed = json.loads(exec_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            if ed.get("conversation") != "single_turn":
+                return False
+            if ed.get("requires"):
+                return False
             return True
         input_mode = meta.get("input_mode")
         return input_mode in (None, "single_turn")
@@ -87,13 +107,23 @@ class TraceTrialBenchAdapter:
             task_ids: list[str] = []
             for task_yaml in sorted((src_root / "Task").glob("*/task.yaml")):
                 meta = yaml.safe_load(task_yaml.read_text(encoding="utf-8")) or {}
-                if self._task_matches_split(meta, self.split):
+                if self._task_matches_split(task_yaml.parent, meta, self.split):
                     tid = str(meta.get("id") or task_yaml.parent.name)
                     task_ids.append(tid)
             return task_ids
         finally:
             if tmp is not None:
                 tmp.cleanup()
+
+    def _resolve_oracle_script(self, task_id: str) -> Path:
+        oracles_dir = Path(__file__).resolve().parent / "oracles"
+        custom = oracles_dir / f"{task_id.lower()}.sh"
+        if custom.is_file():
+            return custom
+        ref_e8 = Path(__file__).resolve().parent / "e8_reference_solve.sh"
+        if task_id == "E8-exit-code-masked-by-output-001" and ref_e8.is_file():
+            return ref_e8
+        return self.template_dir / "solution" / "solve.sh"
 
     def _generate_one_task(self, src_task_dir: Path, dst_task_dir: Path, overwrite: bool) -> bool:
         if dst_task_dir.exists():
@@ -157,21 +187,16 @@ class TraceTrialBenchAdapter:
             dst_ws.mkdir(parents=True, exist_ok=True)
 
         shutil.copy2(self.template_dir / "environment" / "Dockerfile", dst_env / "Dockerfile")
-        sim_script = dst_env / "entrypoint_sim.sh"
-        sim_script.write_text(
-            "#!/usr/bin/env bash\nset -euo pipefail\nexec \"$@\"\n",
-            encoding="utf-8",
-        )
-        sim_script.chmod(0o755)
+        cc_dst = dst_env / "collect_containment.py"
+        shutil.copy2(self.template_dir / "environment" / "collect_containment.py", cc_dst)
+        cc_dst.chmod(0o755)
 
-        # 4. Stage solution/solve.sh (reference oracle for E8 representative task)
+        # 4. Stage solution/solve.sh and record its SHA-256 in tests/oracle_sha256.txt
         solve_dst = dst_sol / "solve.sh"
-        ref_e8 = Path(__file__).resolve().parent / "e8_reference_solve.sh"
-        if task_id == "E8-exit-code-masked-by-output-001" and ref_e8.is_file():
-            shutil.copy2(ref_e8, solve_dst)
-        else:
-            shutil.copy2(self.template_dir / "solution" / "solve.sh", solve_dst)
+        oracle_src = self._resolve_oracle_script(task_id)
+        shutil.copy2(oracle_src, solve_dst)
         solve_dst.chmod(0o755)
+        oracle_sha = hashlib.sha256(solve_dst.read_bytes()).hexdigest()
 
         # 5. Stage separate verifier container context into tests/ (Harbor #3712)
         shutil.copy2(self.template_dir / "tests" / "Dockerfile", dst_tests / "Dockerfile")
@@ -179,13 +204,18 @@ class TraceTrialBenchAdapter:
         shutil.copy2(self.template_dir / "tests" / "test.sh", test_sh_dst)
         test_sh_dst.chmod(0o755)
 
+        shutil.copy2(Path(__file__).resolve().parent / "atif_bridge.py", dst_tests / "atif_bridge.py")
         verify_py_dst = dst_tests / "verify.py"
         shutil.copy2(Path(__file__).resolve().parent / "verify_runner.py", verify_py_dst)
         verify_py_dst.chmod(0o755)
+        (dst_tests / "oracle_sha256.txt").write_text(f"{oracle_sha}\n", encoding="utf-8")
+        (dst_tests / "task_id.txt").write_text(f"{task_id}\n", encoding="utf-8")
 
         src_verifier = src_task_dir / "verifier"
         if src_verifier.is_dir():
             shutil.copytree(src_verifier, dst_tests / "verifier")
+        if src_ws.is_dir():
+            shutil.copytree(src_ws, dst_tests / "workspace")
 
         return True
 
@@ -203,7 +233,7 @@ class TraceTrialBenchAdapter:
             for task_yaml in sorted((src_root / "Task").glob("*/task.yaml")):
                 meta = yaml.safe_load(task_yaml.read_text(encoding="utf-8")) or {}
                 tid = str(meta.get("id") or task_yaml.parent.name)
-                if task_ids is not None or self._task_matches_split(meta, self.split):
+                if task_ids is not None or self._task_matches_split(task_yaml.parent, meta, self.split):
                     task_map[tid] = task_yaml.parent
 
             if task_ids is not None:

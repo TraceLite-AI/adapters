@@ -5,7 +5,7 @@ set -uo pipefail
 OUT_TEXT=$(bash /workspace/tools/ok_then_fail.sh 2>&1)
 EXIT_CODE=$?
 
-mkdir -p /workspace/output /logs/artifacts
+mkdir -p /workspace/output /logs/agent
 
 # 2. Write the exact grounded observation report based on the observed exit code (23) and output
 python3 - "$OUT_TEXT" "$EXIT_CODE" << 'PY'
@@ -84,7 +84,7 @@ atif = {
         },
     ],
 }
-Path("/logs/artifacts/trajectory.json").write_text(
+Path("/logs/agent/oracle_trajectory.json").write_text(
     json.dumps(atif, indent=2) + "\n",
     encoding="utf-8",
 )
