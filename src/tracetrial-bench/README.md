@@ -103,7 +103,7 @@ Parity was evaluated across **3 independent runs per side** (`3 × 14 = 42` tria
 - **Original Benchmark Repository**: <https://github.com/TraceLite-AI/TraceTrial-Bench> (pinned commit [`4f94ae64a8`](https://github.com/TraceLite-AI/TraceTrial-Bench/tree/4f94ae64a8e99ef8806200ffdcf496c9d7390f76))
 - **Harbor Adapter PR**: <https://github.com/harbor-framework/adapters/pull/121>
 - **Harbor Dataset PR**: <https://github.com/harbor-framework/harbor-datasets/pull/286>
-- **Hugging Face Parity PR**: <https://huggingface.co/datasets/harborframework/parity-experiments/discussions/288>
+- **Hugging Face Parity PR**: <https://huggingface.co/datasets/harborframework/parity-experiments/discussions/288> (mirrored at <https://huggingface.co/datasets/TraceLite-AI/tracetrial-bench-harbor-parity> while the shared Hub repo is over the 1M-file cap)
 
 ### Reproduction Commands
 
